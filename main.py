@@ -2,37 +2,51 @@ import torch
 from swin import ShotEmbedding
 from einops import rearrange
 import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
 
 def window_partition(x, window_size):
     '''
     Args:
-        x: (b x (2K) x d_model)
+        x: b x t x d_model
+            - b: batch size
+            - t: total input size (#patches)
+            - d_model: hidden dimension
         window_size: local window size (int)
     Do:
-        x -> (b*(2K/window_size) x window_size x d_model)
+        b x t x d_model -> b*(t/w) x w x d_model
+            - w: local window size
     '''
 
     assert len(x.shape) == 3
-    b, s, d = x.shape # b x (2K) x d_model
+    b, t, d = x.shape
     x = x.view(-1, window_size, d)
     
     return x
 
-def window_reverse(x, window_size):
+
+def window_reverse(x, batch_size):
     '''
     Args:
-        x: ((b * # windows) x window_size x d_model)
+        x: n x w x d_model
+            - n: b * #windows (b * (t/w))
+            - w: local window size
+            - d_model: embedding dimension
         window_size: local window size (int)
     Do:
-        x -> (b x (2k) x d_model)
+        n x w x d_model -> b x t x d_model
+            - b: batch size
+            - t: total input size (#patches)
     '''
 
     assert len(x.shape) == 3
-    x = rearrange(x, "(b n) w d -> b (n w) d", w=window_size)
+    x = rearrange(x, "(b n) w d -> b (n w) d", b=batch_size)
+
     return x
 
 def create_mask(window_size):
-    mask = torch.ones(window_size, window_size)
+    mask = torch.ones(window_size, window_size) # w x w
+    assert window_size % 2 == 0
     displacement = window_size // 2
 
     # mask out quadrand-1,-3
@@ -41,29 +55,13 @@ def create_mask(window_size):
 
     return mask
 
-def get_relative_distances(window_size):
-    indices = torch.tensor(np.array([[x, y] for x in range(window_size) for y in range(window_size)]))
-    distances = indices[None, :, :] - indices[:, None, :]
-    return distances
-
 
 def main():
-    '''
-    model = ShotEmbedding()
-    x = torch.Tensor(4, 16, 2048)
-    y = model(x)
-    print(y.shape)
-    '''
-
-    '''
-    x = torch.Tensor(4, 32, 768)
-    y = window_partition(x, 4)
-    print(y.shape)
-    z = window_reverse(y, 4)
-    print(z.shape)
-    '''
-
-    print(get_relative_distances(4).shape)
+    x = torch.Tensor([[[[2, 2], [1, 1]]]])
+    y = F.softmax(x, dim=-2)
+    print(x.shape)
+    print(x)
+    print(y)
 
 
 if __name__ == "__main__":
