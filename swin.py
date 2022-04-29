@@ -1,8 +1,42 @@
 import math
+from scipy.fftpack import shift
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.LayerNorm = nn.LayerNorm(dim)
+        self.fn = fn
+    
+    def forward(self, x, **kwargs):
+        return self.fn(self.LayerNorm(x), **kwargs)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        return self.ffn(x)
+
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
+
 
 def window_partition(x, window_size):
     '''
@@ -51,7 +85,8 @@ class ShotEmbedding(nn.Module):
 
         '''
         Args:
-            cfg.input_dim: 2048 (frome shot encoder)
+            cfg.neigbor_size: 2*K (16)
+            cfg.input_dim: 2048 (from shot encoder)
             cfg.hidden_size: 768 (embedding dimension -> d_model)
             cfg.hidden_dropout_prob:
         Do: 
@@ -72,12 +107,39 @@ class ShotEmbedding(nn.Module):
         self.dropout = nn.Dropout(cfg.hidden_dropout_prob)
 
     def forward(self, x):
-        shot_emb = self.shot_embedding(x)
-        pos_emb = self.position_embedding(self.pos_ids)
-        embeddings = shot_emb + pos_emb
-        embeddings = self.dropout(self.LayerNorm(embeddings))
+        shot_emb = self.shot_embedding(x) # b x 2K x d_model
+        pos_emb = self.position_embedding(self.pos_ids) # 2K x d_model
+        embeddings = shot_emb + pos_emb # b x 2K x d_model
+        embeddings = self.dropout(self.LayerNorm(embeddings)) # b x 2K x d_model
 
         return embeddings
+
+
+class PatchMerging(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.d_model = d_model
+        self.LayerNorm = nn.LayerNorm(2*d_model)
+        self.reduction = nn.Linear(2*d_model, d_model, bias=False)
+
+    def forward(self, x):
+        '''
+        Args:
+            x: b x t x d_model
+                - b: batch size
+                - t: total input size (#patches)
+                - d_model: embedding dimension
+        Do:
+            b x t x d_model -> b x t' x d_model
+            where t' = t/2
+        '''
+
+        x = rearrange(x, "b (p t) d -> b t (p d)", p=2) # b x t x d_model -> b x (t/2) x 2*d_model
+        x = self.LayerNorm(x) # b x (t/2) x 2*d_model
+        x = self.reduction(x) # b x (t/2) x 2*d_model -> b x (t/2) x d_model
+
+        return x
 
 
 def create_mask(window_size):
@@ -185,12 +247,114 @@ class MultiheadAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
-    ...
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        batch_size,
+        window_size,
+        shifted
+    ):
+        super().__init__()
+        
+        self.attention_block = Residual(PreNorm(d_model, MultiheadAttention(d_model=d_model,
+                                                                            num_heads=num_heads,
+                                                                            batch_size=batch_size,
+                                                                            window_size=window_size,
+                                                                            shifted=shifted)))
+        self.mlp_block = Residual(PreNorm(d_model, FeedForward(input_dim=d_model, hidden_dim=d_model)))
+
+    def forward(self, x):
+        '''
+        Args:
+            x: b x t x d_model
+        Do:
+            attention block -> mlp block
+        '''
+
+        x = self.attention_block(x)
+        x = self.mlp_block(x)
+
+        return x
 
 
-class Stage(nn.Module):
-    ...
+class StageModule(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        d_model,
+        num_heads,
+        batch_size,
+        window_size
+    ):
+        super().__init__()
+        assert num_layers % 2 == 0, "The number of layers in a stage must be divisible by 2"
+        
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers // 2):
+            self.layers.append(nn.ModuleList([
+                SwinTransformerBlock(d_model=d_model, num_heads=num_heads, batch_size=batch_size,
+                                     window_size=window_size, shifted=False), # W-MSA
+                SwinTransformerBlock(d_model=d_model, num_heads=num_heads, batch_size=batch_size,
+                                     window_size=window_size, shifted=True)   # SW-MSA
+            ]))
+
+    def forward(self, x):
+        for regular_block, shifted_block in self.layers:
+            x = regular_block(x)
+            x = shifted_block(x)
+
+        return x
 
 
 class SwinTransformerCRN(nn.Module):
-    ...
+    def __init__(
+        self,
+        cfg,
+        num_layers,
+        d_model,
+        num_heads,
+        batch_size,
+        window_size
+    ):
+        super().__init__()
+
+        self.stage1 = StageModule(num_layers=num_layers[0], d_model=d_model, num_heads=num_heads[0],
+                                   batch_size=batch_size, window_size=window_size[0])
+        self.stage2 = StageModule(num_layers=num_layers[1], d_model=d_model, num_heads=num_heads[1],
+                                   batch_size=batch_size, window_size=window_size[1])
+
+        self.shot_embedding = ShotEmbedding(cfg=cfg)
+        self.patch_merging = PatchMerging(d_model=d_model)
+
+        self.classification_head = nn.Sequential(
+            nn.LayerNorm(4*d_model),
+            nn.Linear(4*d_model, 2)
+        )
+
+    def forward(self, x):
+        x = self.stage1(self.shot_embedding(x)) # b x 2K x d_model
+        x = self.stage2(self.patch_merging(x)) # b x K x d_model
+        x = self.patch_merging(x) # b x (K/2) x d_model
+        x = rearrange(x, "b t d -> b (t d)") # b x (K/2)*d_model (flatten)
+        x = self.classification_head(x) # b x 2
+
+        return x
+
+
+def get_model(
+    cfg,
+    num_layers=(2, 2),
+    d_model=768, 
+    num_heads=(3, 6), 
+    batch_size=4, 
+    window_size=(8, 4)
+):
+    model = SwinTransformerCRN(cfg=cfg,
+                               num_layers=num_layers,
+                               d_model=d_model,
+                               num_heads=num_heads,
+                               batch_size=batch_size,
+                               window_size=window_size)
+
+    return model
