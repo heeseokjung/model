@@ -1,5 +1,4 @@
 import math
-from scipy.fftpack import shift
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
