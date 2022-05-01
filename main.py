@@ -11,7 +11,9 @@ class Config():
 def main():
     cfg = Config()
     input = torch.randn(4, 16, 2048)
+    input = input.to('cuda')
     model = get_model(cfg=cfg)
+    model = model.to('cuda')
 
     pred = model(input)
     print(pred)
