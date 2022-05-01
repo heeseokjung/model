@@ -150,7 +150,7 @@ def create_mask(window_size):
     mask[:displacement, -displacement:] = 0
     mask[-displacement:, :displacement] = 0
 
-    return mask
+    return mask.to('cuda')
 
 
 def scaled_dot_product(q, k, v, mask=None):
